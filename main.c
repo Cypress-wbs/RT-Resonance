@@ -1,6 +1,6 @@
 #include <rtthread.h>
 #include <board.h>
-#include <rfp602.h>
+#include "rfp602.h"
 #include "oled_test.h"
 
 // 外部驱动函数声明
@@ -9,7 +9,7 @@ extern void mpu6050_get_gyro(short *gx, short *gy, short *gz);
 
 // ==================== [系统参数与阈值宏定义] ====================
 #define SAMPLE_PERIOD_MS            5
-#define GYRO_LPF_DIV                4
+#define GYRO_LPF_DIV                4    // 恢复为4，保证波形响应速度
 #define RFP_AVG_WINDOW              10
 #define RFP_CALIB_SAMPLES           100  // 极速标定采样数 (0.5秒)
 #define FEATURE_WINDOW_SAMPLES      400  // 特征工程滑动窗口大小 (2秒数据)
@@ -20,9 +20,9 @@ extern void mpu6050_get_gyro(short *gx, short *gy, short *gz);
 #define RFP_SQUEEZE_TRIGGER         2200 // 用力紧绷触发阈值
 #define RFP_MIN_SPAN                50   // 标定最小差值保护
 
-// 【新增：运动学高级抗噪参数】
-#define MIN_VIBRATO_AMPLITUDE       600  // 有效揉弦的最小振幅(大幅提高，无视静息颤抖)
-#define MIN_CROSSING_GAP            5    // 施密特触发器的最小时间锁(拒绝高频生理噪点)
+// 【限制运动学参数】
+#define MIN_VIBRATO_AMPLITUDE       160
+#define MIN_CROSSING_GAP            10
 
 // RFP 标定状态机状态定义
 enum
@@ -122,7 +122,7 @@ static void update_vibrato_features(const int32_t *gyro_window, int32_t sample_c
     int32_t amplitude = gyro_max - gyro_min;
 
     int32_t threshold = amplitude / 4;
-    if (threshold < 150) threshold = 150; // 提高底层防噪线
+    if (threshold < 40) threshold = 40;
 
     int32_t upward_crossings = 0;
     int32_t first_crossing_idx = -1;
@@ -137,7 +137,6 @@ static void update_vibrato_features(const int32_t *gyro_window, int32_t sample_c
 
         if (current_state == -1 && centered >= threshold)
         {
-            // 【时间间隙锁】：两次过零必须间隔至少 MIN_CROSSING_GAP 个点，否则视为噪点丢弃！
             if (i - last_state_change >= MIN_CROSSING_GAP)
             {
                 current_state = 1;
@@ -159,23 +158,33 @@ static void update_vibrato_features(const int32_t *gyro_window, int32_t sample_c
 
     g_vibrato_amplitude = amplitude;
 
-    // 【振幅锁】：静置时微小颤动振幅达不到 MIN_VIBRATO_AMPLITUDE (600)，直接归零！
+    int32_t target_freq = 0;
     if (amplitude < MIN_VIBRATO_AMPLITUDE || upward_crossings < 2)
     {
-        g_vibrato_freq_x100 = 0;
+        target_freq = 0;
     }
     else
     {
         int32_t delta_samples = last_crossing_idx - first_crossing_idx;
         if (delta_samples > 0)
         {
-            g_vibrato_freq_x100 = ((upward_crossings - 1) * 100000) / (delta_samples * SAMPLE_PERIOD_MS);
-        }
-        else
-        {
-            g_vibrato_freq_x100 = 0;
+            target_freq = ((upward_crossings - 1) * 100000) / (delta_samples * SAMPLE_PERIOD_MS);
+            if (target_freq > 1200) target_freq = 1200;
         }
     }
+
+    static int32_t smooth_freq = 0;
+    if (target_freq == 0)
+    {
+        smooth_freq = 0;
+    }
+    else
+    {
+        if (smooth_freq == 0) smooth_freq = target_freq;
+        else smooth_freq = (smooth_freq * 3 + target_freq) / 4;
+    }
+
+    g_vibrato_freq_x100 = smooth_freq;
 }
 
 static void edge_ai_thread_entry(void *parameter)
@@ -197,7 +206,6 @@ static void edge_ai_thread_entry(void *parameter)
 
     while (1)
     {
-        // 1. 读取 MPU6050
         mpu6050_get_gyro(&raw_gx, &raw_gy, &raw_gz);
         g_raw_gy = (int32_t)raw_gy;
 
@@ -212,7 +220,6 @@ static void edge_ai_thread_entry(void *parameter)
         }
         g_filtered_gy = gyro_lpf;
 
-        // 2. 读取 RFP 并滤波
         RFP_read_raw();
 
         int32_t temp_RFP = g_RFP1_raw;
@@ -298,8 +305,6 @@ static void edge_ai_thread_entry(void *parameter)
 
             if (g_RFP_calib_state == RFP_STATE_READY)
             {
-                // 【核心修复：动态探底】如果发现当前握力比之前标定的"极小值"还要小，自动降低极小值！
-                // 这彻底解决了刚标定完，一恢复正常握力就归 0% 的假死现象。
                 if (g_RFP1_filtered < g_RFP1_min) g_RFP1_min = g_RFP1_filtered;
                 if (g_RFP2_filtered < g_RFP2_min) g_RFP2_min = g_RFP2_filtered;
 
@@ -313,7 +318,6 @@ static void edge_ai_thread_entry(void *parameter)
             }
         }
 
-        // 4. 特征滑动窗装载
         s_gyro_window[feature_index] = g_filtered_gy;
         s_RFP1_window[feature_index] = g_RFP1_tension_pct;
         s_RFP2_window[feature_index] = g_RFP2_tension_pct;
@@ -324,7 +328,6 @@ static void edge_ai_thread_entry(void *parameter)
             feature_count++;
         }
 
-        // 5. 特征定时计算 (主频 100Hz 触发)
         feature_tick++;
         if ((feature_count >= FEATURE_WINDOW_SAMPLES) && (feature_tick >= FEATURE_UPDATE_INTERVAL))
         {
